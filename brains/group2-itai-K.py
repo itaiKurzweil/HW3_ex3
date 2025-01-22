@@ -31,6 +31,13 @@ class Group2ItaiK(SpaceshipBrain):
         self.angle_offset = 90                # Degrees to offset for circling (positive for counterclockwise)
         self.circle_angle_tolerance = 20      # How close to the desired circling angle before accelerating
 
+        # --- Shooting Cooldown ---
+        self.shoot_cooldown = 0              # Frames until next allowed shot
+
+        # --- Health Tracking ---
+        self.previous_health = 100            # Initialize with full health (adjust if different)
+        self.under_attack = False             # Flag to indicate if the ship is under attack
+
     @property
     def id(self) -> str:
         return self._id
@@ -39,15 +46,38 @@ class Group2ItaiK(SpaceshipBrain):
     # Main decision loop
     # -------------------------------------------------------------------------
     def decide_what_to_do_next(self, game_state: GameState) -> Action:
+        # Decrement shoot cooldown if active
+        if self.shoot_cooldown > 0:
+            self.shoot_cooldown -= 1
+
 
         my_ship = self._get_my_ship(game_state)
         if not my_ship or my_ship['health'] <= 0:
             return Action.ROTATE_RIGHT  # Fallback if destroyed or invalid
 
 
-        shoot_action = self._check_if_enemy_in_front(my_ship, game_state.ships)
-        if shoot_action:
-            return shoot_action
+        current_health = my_ship['health']
+        if current_health < self.previous_health:
+            self.under_attack = True
+        else:
+            self.under_attack = False
+        self.previous_health = current_health
+
+
+        if self.under_attack:
+            attacker = self._find_attacker(my_ship, game_state.ships)
+            if attacker:
+                return self._accelerate_away_from_attacker(my_ship, attacker)
+            else:
+                # If attacker not found, accelerate in the opposite direction of last movement
+                return Action.ACCELERATE
+
+
+        if self.shoot_cooldown == 0:
+            shoot_action = self._check_if_enemy_in_front(my_ship, game_state.ships)
+            if shoot_action:
+                self.shoot_cooldown = 2  # Set cooldown (e.g., 2 frames)
+                return shoot_action
 
 
         if self._near_border(my_ship['x'], my_ship['y']):
@@ -69,9 +99,13 @@ class Group2ItaiK(SpaceshipBrain):
                 )
 
 
-        close_enemy = self._find_close_enemy(my_ship, game_state.ships, self.circle_range)
-        if close_enemy:
-            return self._circle_around_and_shoot(my_ship, close_enemy)
+        if self.shoot_cooldown == 0:
+            close_enemy = self._find_close_enemy(my_ship, game_state.ships, self.circle_range)
+            if close_enemy:
+                circling_action = self._circle_around_and_shoot(my_ship, close_enemy)
+                if circling_action == Action.SHOOT:
+                    self.shoot_cooldown = 2  # Set cooldown after shooting
+                return circling_action
 
 
         if self._is_close_under_any_ship(my_ship, game_state.ships):
@@ -80,7 +114,7 @@ class Group2ItaiK(SpaceshipBrain):
 
         enemy_ships = [s for s in game_state.ships if s['id'] != self.id and s['health'] > 0]
         if not enemy_ships:
-            return Action.ROTATE_RIGHT  # No enemies => rotate in place
+            return Action.ACCELERATE  # No enemies => keep accelerating to stay in motion
 
         target = self._pick_or_validate_target(my_ship, enemy_ships)
         return self._engage_enemy(my_ship, target)
@@ -149,10 +183,8 @@ class Group2ItaiK(SpaceshipBrain):
         if abs(angle_diff) < self.shoot_angle_threshold:
             if distance < self.optimal_range:
                 return Action.SHOOT
-            elif distance > self.optimal_range:
-                return Action.ACCELERATE
             else:
-                return Action.ACCELERATE  # Changed from BRAKE to ACCELERATE to keep moving
+                return Action.ACCELERATE
         else:
             return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
 
@@ -272,14 +304,12 @@ class Group2ItaiK(SpaceshipBrain):
             return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
         else:
             # If aligned with circling angle, accelerate to maintain orbit
-            action = Action.ACCELERATE
-
             # Additionally, check if we're aligned to shoot
             face_diff = self._normalize_angle_diff(direct_angle - angle)
-            if abs(face_diff) < self.shoot_angle_threshold:
+            if abs(face_diff) < self.shoot_angle_threshold and self.shoot_cooldown == 0:
                 return Action.SHOOT
-
-            return action
+            else:
+                return Action.ACCELERATE
 
     def _move_away_from_border(self, my_ship):
         """
@@ -304,4 +334,42 @@ class Group2ItaiK(SpaceshipBrain):
             return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
         else:
             # If somewhat aligned, accelerate to move away from the border
+            return Action.ACCELERATE
+
+    def _find_attacker(self, my_ship, all_ships):
+        """
+        Identify the attacker based on health decrease.
+        Assumes the closest enemy is the attacker.
+        """
+        enemy_ships = [s for s in all_ships if s['id'] != self.id and s['health'] > 0]
+        if not enemy_ships:
+            return None
+        # Choose the closest enemy as the attacker
+        attacker = min(
+            enemy_ships,
+            key=lambda s: math.hypot(s['x'] - my_ship['x'], s['y'] - my_ship['y'])
+        )
+        return attacker
+
+    def _accelerate_away_from_attacker(self, my_ship, attacker):
+        """
+        Rotate away from the attacker and accelerate to evade.
+        """
+        sx, sy = my_ship['x'], my_ship['y']
+        angle = my_ship['angle']
+        tx, ty = attacker['x'], attacker['y']
+
+        dx = tx - sx
+        dy = ty - sy
+        attacker_angle = math.degrees(math.atan2(dy, dx))
+        # Desired angle is directly opposite to the attacker
+        desired_angle = (attacker_angle + 180) % 360
+
+        angle_diff = self._normalize_angle_diff(desired_angle - angle)
+
+        # Rotate towards the desired angle
+        if abs(angle_diff) > self.circle_angle_tolerance:
+            return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
+        else:
+            # Accelerate away from the attacker
             return Action.ACCELERATE
