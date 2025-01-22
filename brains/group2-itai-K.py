@@ -2,6 +2,7 @@
 from brain_interface import SpaceshipBrain, Action, GameState
 import math
 
+# Game boundaries
 SCREEN_WIDTH = 1500
 SCREEN_HEIGHT = 800
 BORDER_LEFT = 50
@@ -25,6 +26,11 @@ class Group2ItaiK(SpaceshipBrain):
         self.gold_seek_distance = 300        # If gold is closer than this, we'll chase it
         self.gold_angle_threshold = 20       # Angle tolerance when rotating to gold
 
+        # --- Circling logic ---
+        self.circle_range = 120               # If an enemy is closer than this, circle them
+        self.angle_offset = 90                # Degrees to offset for circling (positive for counterclockwise)
+        self.circle_angle_tolerance = 20      # How close to the desired circling angle before accelerating
+
     @property
     def id(self) -> str:
         return self._id
@@ -33,24 +39,22 @@ class Group2ItaiK(SpaceshipBrain):
     # Main decision loop
     # -------------------------------------------------------------------------
     def decide_what_to_do_next(self, game_state: GameState) -> Action:
-        # 1) Find my ship
+
         my_ship = self._get_my_ship(game_state)
         if not my_ship or my_ship['health'] <= 0:
-            return Action.ROTATE_RIGHT  # If we're destroyed or invalid
+            return Action.ROTATE_RIGHT  # Fallback if destroyed or invalid
 
-        # 2) Quick opportunistic shooting check:
+
         shoot_action = self._check_if_enemy_in_front(my_ship, game_state.ships)
         if shoot_action:
-            return shoot_action  # SHOOT if an enemy is lined up
+            return shoot_action
 
-        # 3) Border avoidance
+
         if self._near_border(my_ship['x'], my_ship['y']):
-            # Move away from border toward center
-            center_x = (BORDER_LEFT + (SCREEN_WIDTH - BORDER_RIGHT)) / 2
-            center_y = (BORDER_TOP + (SCREEN_HEIGHT - BORDER_BOTTOM)) / 2
-            return self._rotate_and_move_toward_target(my_ship, center_x, center_y)
+            # Actively move away from border
+            return self._move_away_from_border(my_ship)
 
-        # 4) Gold collection
+
         gold_positions = game_state.gold_positions
         if gold_positions:
             nearest_gold, gold_dist = self._find_closest_object(my_ship['x'], my_ship['y'], gold_positions)
@@ -64,14 +68,19 @@ class Group2ItaiK(SpaceshipBrain):
                     shoot=False        # We can't shoot gold
                 )
 
-        # 5) NEW STEP: Accelerate if "close under" another ship
+
+        close_enemy = self._find_close_enemy(my_ship, game_state.ships, self.circle_range)
+        if close_enemy:
+            return self._circle_around_and_shoot(my_ship, close_enemy)
+
+
         if self._is_close_under_any_ship(my_ship, game_state.ships):
             return Action.ACCELERATE
 
-        # 6) If no border or gold logic triggers, engage enemies
+
         enemy_ships = [s for s in game_state.ships if s['id'] != self.id and s['health'] > 0]
         if not enemy_ships:
-            return Action.ROTATE_RIGHT  # No enemies => default spin
+            return Action.ROTATE_RIGHT  # No enemies => rotate in place
 
         target = self._pick_or_validate_target(my_ship, enemy_ships)
         return self._engage_enemy(my_ship, target)
@@ -143,17 +152,17 @@ class Group2ItaiK(SpaceshipBrain):
             elif distance > self.optimal_range:
                 return Action.ACCELERATE
             else:
-                return Action.BRAKE
+                return Action.ACCELERATE  # Changed from BRAKE to ACCELERATE to keep moving
         else:
             return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
 
-    def _rotate_and_move_toward_target(self, my_ship, target_x, target_y,
+    def _rotate_and_move_toward_target(self, my_ship, tx, ty,
                                        angle_threshold=10, optimal_range=100,
                                        shoot=True):
         sx, sy = my_ship['x'], my_ship['y']
         angle = my_ship['angle']
-        dx = target_x - sx
-        dy = target_y - sy
+        dx = tx - sx
+        dy = ty - sy
         distance = math.hypot(dx, dy)
         target_angle = math.degrees(math.atan2(dy, dx))
         angle_diff = self._normalize_angle_diff(target_angle - angle)
@@ -162,7 +171,7 @@ class Group2ItaiK(SpaceshipBrain):
             if distance > optimal_range:
                 return Action.ACCELERATE
             else:
-                return Action.SHOOT if shoot else Action.BRAKE
+                return Action.SHOOT if shoot else Action.ACCELERATE  # Changed from BRAKE to ACCELERATE
         else:
             return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
 
@@ -170,25 +179,25 @@ class Group2ItaiK(SpaceshipBrain):
         if not object_positions:
             return (None, float('inf'))
 
-        closest = None
-        min_dist = float('inf')
+        best_pos = None
+        best_dist = float('inf')
         for pos in object_positions:
             dx = pos[0] - sx
             dy = pos[1] - sy
             dist = math.hypot(dx, dy)
-            if dist < min_dist:
-                min_dist = dist
-                closest = pos
-        return (closest, min_dist)
+            if dist < best_dist:
+                best_dist = dist
+                best_pos = pos
+        return (best_pos, best_dist)
 
-    def _normalize_angle_diff(self, angle_diff):
-        angle_diff = (angle_diff + 360) % 360
-        if angle_diff > 180:
-            angle_diff -= 360
-        return angle_diff
+    def _normalize_angle_diff(self, diff):
+        diff = (diff + 360) % 360
+        if diff > 180:
+            diff -= 360
+        return diff
 
     # -------------------------------------------------------------------------
-    # NEW: Helper to check if we're "close under" any living enemy.
+    # New Helper Methods
     # -------------------------------------------------------------------------
     def _is_close_under_any_ship(self, my_ship, all_ships):
         """
@@ -211,3 +220,88 @@ class Group2ItaiK(SpaceshipBrain):
                 return True
 
         return False
+
+    def _find_close_enemy(self, my_ship, all_ships, max_dist):
+        """
+        Return the closest enemy (not me) that is within max_dist, or None if none.
+        """
+        sx, sy = my_ship['x'], my_ship['y']
+        closest_enemy = None
+        min_distance = float('inf')
+
+        for enemy in all_ships:
+            if enemy['id'] == self.id or enemy['health'] <= 0:
+                continue
+            dx = enemy['x'] - sx
+            dy = enemy['y'] - sy
+            distance = math.hypot(dx, dy)
+            if distance < max_dist and distance < min_distance:
+                min_distance = distance
+                closest_enemy = enemy
+
+        return closest_enemy
+
+    def _circle_around_and_shoot(self, my_ship, target):
+        """
+        Circle around the target deterministically and shoot when aligned.
+        Steps:
+        1. Calculate the direct angle to the target.
+        2. Determine the desired circling angle (direct_angle + offset).
+        3. Rotate towards the desired circling angle.
+        4. Accelerate to maintain orbiting.
+        5. Shoot when facing the target.
+        """
+        sx, sy = my_ship['x'], my_ship['y']
+        angle = my_ship['angle']
+        tx, ty = target['x'], target['y']
+
+        dx = tx - sx
+        dy = ty - sy
+        distance = math.hypot(dx, dy)
+
+        # Angle to the target
+        direct_angle = math.degrees(math.atan2(dy, dx))
+        # Desired circling angle (offset to the left for counterclockwise)
+        desired_angle = (direct_angle + self.angle_offset) % 360
+
+        # Calculate angle difference
+        angle_diff = self._normalize_angle_diff(desired_angle - angle)
+
+        # Rotate towards the desired circling angle
+        if abs(angle_diff) > self.circle_angle_tolerance:
+            return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
+        else:
+            # If aligned with circling angle, accelerate to maintain orbit
+            action = Action.ACCELERATE
+
+            # Additionally, check if we're aligned to shoot
+            face_diff = self._normalize_angle_diff(direct_angle - angle)
+            if abs(face_diff) < self.shoot_angle_threshold:
+                return Action.SHOOT
+
+            return action
+
+    def _move_away_from_border(self, my_ship):
+        """
+        Actively rotate and accelerate away from the border to prevent getting stuck.
+        Aim towards the center and accelerate even if not perfectly aligned.
+        """
+        center_x = (BORDER_LEFT + (SCREEN_WIDTH - BORDER_RIGHT)) / 2
+        center_y = (BORDER_TOP + (SCREEN_HEIGHT - BORDER_BOTTOM)) / 2
+        sx, sy = my_ship['x'], my_ship['y']
+        angle = my_ship['angle']
+
+        dx = center_x - sx
+        dy = center_y - sy
+        target_angle = math.degrees(math.atan2(dy, dx))
+        angle_diff = self._normalize_angle_diff(target_angle - angle)
+
+        # Define how much we tolerate misalignment before rotating
+        TURN_THRESHOLD = 30  # degrees
+
+        if abs(angle_diff) > TURN_THRESHOLD:
+            # Rotate towards the center
+            return Action.ROTATE_RIGHT if angle_diff > 0 else Action.ROTATE_LEFT
+        else:
+            # If somewhat aligned, accelerate to move away from the border
+            return Action.ACCELERATE
